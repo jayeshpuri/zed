@@ -34,16 +34,91 @@ pub struct TextLayoutDetails {
     pub vertical_scroll_margin: ScrollOffset,
 }
 
+/// Deleted diff rows are rendered for review but do not belong to the live
+/// buffer, so the cursor should not be able to land in them.
+pub(crate) fn is_deleted_diff_row(map: &DisplaySnapshot, row: DisplayRow) -> bool {
+    map.row_infos(row)
+        .next()
+        .and_then(|info| info.diff_status)
+        .is_some_and(|status| status.is_deleted())
+}
+
+fn live_row_above(map: &DisplaySnapshot, mut row: DisplayRow) -> Option<DisplayRow> {
+    while is_deleted_diff_row(map, row) {
+        if row.0 == 0 {
+            return None;
+        }
+        row = DisplayRow(row.0 - 1);
+    }
+    Some(row)
+}
+
+fn live_row_below(map: &DisplaySnapshot, mut row: DisplayRow) -> Option<DisplayRow> {
+    let max_row = map.max_point().row();
+    while is_deleted_diff_row(map, row) {
+        if row >= max_row {
+            return None;
+        }
+        row = DisplayRow(row.0 + 1);
+    }
+    Some(row)
+}
+
+/// Deleted rows belong to the excerpt that contains their hunk. Comparing
+/// excerpts keeps movement from jumping into a neighboring excerpt in a
+/// multi-file diff view.
+fn in_same_excerpt(map: &DisplaySnapshot, origin_row: DisplayRow, target_row: DisplayRow) -> bool {
+    let snapshot = map.buffer_snapshot();
+    let origin_point = DisplayPoint::new(origin_row, 0).to_point(map);
+    let target_point = DisplayPoint::new(target_row, 0).to_point(map);
+
+    let Some((origin_buffer, origin_range)) =
+        snapshot.excerpt_containing(origin_point..origin_point)
+    else {
+        return false;
+    };
+    let Some((target_buffer, target_range)) =
+        snapshot.excerpt_containing(target_point..target_point)
+    else {
+        return false;
+    };
+
+    origin_buffer.remote_id() == target_buffer.remote_id() && origin_range == target_range
+}
+
 /// Returns a column to the left of the current point, wrapping
 /// to the previous line if that point is at the start of line.
-pub fn left(map: &DisplaySnapshot, mut point: DisplayPoint) -> DisplayPoint {
-    if point.column() > 0 {
-        *point.column_mut() -= 1;
+///
+/// Deleted diff rows are skipped, matching the behavior of inline diffs in
+/// other editors: movement lands at the end of the nearest live row above.
+pub fn left(map: &DisplaySnapshot, point: DisplayPoint) -> DisplayPoint {
+    let candidate = if point.column() > 0 {
+        DisplayPoint::new(point.row(), point.column() - 1)
     } else if point.row().0 > 0 {
-        *point.row_mut() -= 1;
-        *point.column_mut() = map.line_len(point.row());
+        let row = DisplayRow(point.row().0 - 1);
+        DisplayPoint::new(row, map.line_len(row))
+    } else {
+        return map.clip_point(point, Bias::Left);
+    };
+
+    if !map.buffer_snapshot().has_diff_hunks() || !is_deleted_diff_row(map, candidate.row()) {
+        return map.clip_point(candidate, Bias::Left);
     }
-    map.clip_point(point, Bias::Left)
+
+    let mut row = candidate.row();
+    while row.0 > 0 && is_deleted_diff_row(map, row) {
+        row = DisplayRow(row.0 - 1);
+    }
+
+    if is_deleted_diff_row(map, row) || !in_same_excerpt(map, point.row(), row) {
+        return map.clip_point(point, Bias::Left);
+    }
+
+    let target = map.clip_point(DisplayPoint::new(row, map.line_len(row)), Bias::Left);
+    if target.row() != row {
+        return map.clip_point(point, Bias::Left);
+    }
+    target
 }
 
 /// Returns a column to the left of the current point, doing nothing if
@@ -63,14 +138,37 @@ pub fn saturating_left(map: &DisplaySnapshot, mut point: DisplayPoint) -> Displa
 
 /// Returns a column to the right of the current point, wrapping
 /// to the next line if that point is at the end of line.
-pub fn right(map: &DisplaySnapshot, mut point: DisplayPoint) -> DisplayPoint {
-    if point.column() < map.line_len(point.row()) {
-        *point.column_mut() += 1;
+///
+/// Deleted diff rows are skipped, matching the behavior of inline diffs in
+/// other editors: movement lands at the start of the nearest live row below.
+pub fn right(map: &DisplaySnapshot, point: DisplayPoint) -> DisplayPoint {
+    let candidate = if point.column() < map.line_len(point.row()) {
+        DisplayPoint::new(point.row(), point.column() + 1)
     } else if point.row() < map.max_point().row() {
-        *point.row_mut() += 1;
-        *point.column_mut() = 0;
+        DisplayPoint::new(DisplayRow(point.row().0 + 1), 0)
+    } else {
+        return map.clip_point(point, Bias::Right);
+    };
+
+    if !map.buffer_snapshot().has_diff_hunks() || !is_deleted_diff_row(map, candidate.row()) {
+        return map.clip_point(candidate, Bias::Right);
     }
-    map.clip_point(point, Bias::Right)
+
+    let mut row = candidate.row();
+    let max_row = map.max_point().row();
+    while row < max_row && is_deleted_diff_row(map, row) {
+        row = DisplayRow(row.0 + 1);
+    }
+
+    if is_deleted_diff_row(map, row) || !in_same_excerpt(map, point.row(), row) {
+        return map.clip_point(point, Bias::Right);
+    }
+
+    let target = map.clip_point(DisplayPoint::new(row, 0), Bias::Right);
+    if target.row() != row {
+        return map.clip_point(point, Bias::Right);
+    }
+    target
 }
 
 /// Returns a column to the right of the current point, not performing any wrapping
@@ -132,6 +230,16 @@ pub(crate) fn up_by_rows(
     };
 
     let prev_row = DisplayRow(start.row().0.saturating_sub(row_count));
+    let prev_row = if map.buffer_snapshot().has_diff_hunks() && is_deleted_diff_row(map, prev_row) {
+        // Deleted diff rows are review-only, so vertical movement skips the
+        // whole block instead of stopping inside it.
+        let Some(live_row) = live_row_above(map, prev_row) else {
+            return (start, goal);
+        };
+        live_row
+    } else {
+        prev_row
+    };
     let mut point = map.clip_point(
         DisplayPoint::new(prev_row, map.line_len(prev_row)),
         Bias::Left,
@@ -170,6 +278,16 @@ pub(crate) fn down_by_rows(
     };
 
     let new_row = DisplayRow(start.row().0 + row_count);
+    let new_row = if map.buffer_snapshot().has_diff_hunks() && is_deleted_diff_row(map, new_row) {
+        // Deleted diff rows are review-only, so vertical movement skips the
+        // whole block instead of stopping inside it.
+        let Some(live_row) = live_row_below(map, new_row) else {
+            return (start, goal);
+        };
+        live_row
+    } else {
+        new_row
+    };
     let mut point = map.clip_point(DisplayPoint::new(new_row, 0), Bias::Right);
     if point.row() > start.row() {
         *point.column_mut() = map.display_column_for_x(point.row(), goal_x, text_layout_details)

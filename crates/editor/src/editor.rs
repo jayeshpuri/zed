@@ -5278,9 +5278,12 @@ impl Editor {
             for selection in &mut selections {
                 if selection.is_empty() {
                     let old_head = selection.head();
+                    let old_head_display = old_head.to_display_point(&display_map);
+                    if movement::is_deleted_diff_row(&display_map, old_head_display.row()) {
+                        continue;
+                    }
                     let mut new_head =
-                        movement::left(&display_map, old_head.to_display_point(&display_map))
-                            .to_point(&display_map);
+                        movement::left(&display_map, old_head_display).to_point(&display_map);
                     if let Some((buffer, line_buffer_range)) = display_map
                         .buffer_snapshot()
                         .buffer_line_for_row(MultiBufferRow(old_head.row))
@@ -5330,6 +5333,9 @@ impl Editor {
             this.change_selections(Default::default(), window, cx, |s| {
                 s.move_with(&mut |map, selection| {
                     if selection.is_empty() {
+                        if movement::is_deleted_diff_row(map, selection.head().row()) {
+                            return;
+                        }
                         let cursor = movement::right(map, selection.head());
                         selection.end = cursor;
                         selection.reversed = true;
