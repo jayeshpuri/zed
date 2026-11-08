@@ -1,8 +1,8 @@
 use crate::{
-    Copy, CopyAndTrim, CopyPermalinkToLine, Cut, DisplayPoint, DisplaySnapshot, Editor,
-    EvaluateSelectedText, FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation,
-    GoToTypeDefinition, Paste, Rename, RevealInFileManager, RunToCursor, SelectMode,
-    SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
+    Copy, CopyAndTrim, CopyDeletedHunkText, CopyPermalinkToLine, Cut, DisplayPoint,
+    DisplaySnapshot, Editor, EvaluateSelectedText, FindAllReferences, GoToDeclaration,
+    GoToDefinition, GoToImplementation, GoToTypeDefinition, Paste, Rename, RevealInFileManager,
+    RunToCursor, SelectMode, SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
     actions::{Format, FormatSelections},
     selections_collection::SelectionsCollection,
 };
@@ -205,6 +205,8 @@ pub fn deploy_context_menu(
             .all::<PointUtf16>(&display_map)
             .into_iter()
             .any(|s| !s.is_empty());
+        let has_deleted_hunk =
+            crate::movement::deleted_block_near_row(&display_map, point.row()).is_some();
         let has_git_repo =
             buffer
                 .anchor_to_buffer_anchor(anchor)
@@ -298,6 +300,9 @@ pub fn deploy_context_menu(
                 .action("Cut", Box::new(Cut))
                 .action("Copy", Box::new(Copy))
                 .action("Copy and Trim", Box::new(CopyAndTrim))
+                .when(has_deleted_hunk, |builder| {
+                    builder.action("Copy Deleted Lines", Box::new(CopyDeletedHunkText))
+                })
                 .action("Paste", Box::new(Paste))
                 .separator()
                 .action_disabled_when(

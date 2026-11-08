@@ -3,7 +3,7 @@
 
 use super::{Bias, DisplayPoint, DisplaySnapshot, SelectionGoal, ToDisplayPoint};
 use crate::{
-    DisplayRow, EditorStyle, ToOffset, ToPoint,
+    DisplayRow, EditorStyle, RowExt, ToOffset, ToPoint,
     scroll::{ScrollOffset, SharedScrollAnchor},
 };
 use gpui::{Pixels, WindowTextSystem};
@@ -62,6 +62,84 @@ fn live_row_below(map: &DisplaySnapshot, mut row: DisplayRow) -> Option<DisplayR
         row = DisplayRow(row.0 + 1);
     }
     Some(row)
+}
+
+/// Returns the rows covered by the deleted diff block containing `row`, with
+/// an exclusive end. Returns `None` when `row` is not deleted.
+pub(crate) fn deleted_block_bounds(
+    map: &DisplaySnapshot,
+    row: DisplayRow,
+) -> Option<Range<DisplayRow>> {
+    if !is_deleted_diff_row(map, row) {
+        return None;
+    }
+
+    let mut start = row;
+    while start.0 > 0 && is_deleted_diff_row(map, DisplayRow(start.0 - 1)) {
+        start = DisplayRow(start.0 - 1);
+    }
+
+    let max_row = map.max_point().row();
+    let mut end = row;
+    while end < max_row && is_deleted_diff_row(map, DisplayRow(end.0 + 1)) {
+        end = DisplayRow(end.0 + 1);
+    }
+
+    Some(start..end.next_row())
+}
+
+/// Returns the deleted block containing `row`, or the block immediately above
+/// or below it. Used to find the hunk a mouse click or cursor is next to.
+pub(crate) fn deleted_block_near_row(
+    map: &DisplaySnapshot,
+    row: DisplayRow,
+) -> Option<Range<DisplayRow>> {
+    deleted_block_bounds(map, row)
+        .or_else(|| {
+            row.0
+                .checked_add(1)
+                .and_then(|row| deleted_block_bounds(map, DisplayRow(row)))
+        })
+        .or_else(|| {
+            row.0
+                .checked_sub(1)
+                .and_then(|row| deleted_block_bounds(map, DisplayRow(row)))
+        })
+}
+
+/// Returns the point on the nearest live row in the same excerpt, preserving
+/// the column where possible. Returns `None` when `point` is not on a deleted
+/// row or the block has no live neighbor in its excerpt.
+pub(crate) fn nearest_live_point(
+    map: &DisplaySnapshot,
+    point: DisplayPoint,
+) -> Option<DisplayPoint> {
+    let block = deleted_block_bounds(map, point.row())?;
+
+    let above = if block.start.0 > 0 {
+        live_row_above(map, DisplayRow(block.start.0 - 1))
+            .filter(|&row| in_same_excerpt(map, point.row(), row))
+    } else {
+        None
+    };
+    let below =
+        live_row_below(map, block.end).filter(|&row| in_same_excerpt(map, point.row(), row));
+
+    let target = match (above, below) {
+        (Some(above), Some(below)) => {
+            if point.row().0 - above.0 <= below.0 - point.row().0 {
+                above
+            } else {
+                below
+            }
+        }
+        (Some(above), None) => above,
+        (None, Some(below)) => below,
+        (None, None) => return None,
+    };
+
+    let column = point.column().min(map.line_len(target));
+    Some(map.clip_point(DisplayPoint::new(target, column), Bias::Left))
 }
 
 /// Deleted rows belong to the excerpt that contains their hunk. Comparing

@@ -54,6 +54,7 @@ impl Editor {
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut MutableSelectionsCollection<'_, '_>) -> R,
     ) -> R {
+        self.clear_ghost_selection();
         self.change_selections_with_history(effects, None, window, cx, change)
     }
 
@@ -1124,6 +1125,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_ghost_selection();
         self.hide_context_menu(window, cx);
 
         match phase {

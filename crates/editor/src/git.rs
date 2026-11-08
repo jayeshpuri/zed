@@ -554,6 +554,36 @@ impl Editor {
         });
     }
 
+    pub fn copy_deleted_hunk_text(
+        &mut self,
+        _: &CopyDeletedHunkText,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_snapshot(cx);
+        let head = self.selections.newest::<Point>(&display_map).head();
+        let row = head.to_display_point(&display_map).row();
+        let Some(block) = movement::deleted_block_near_row(&display_map, row) else {
+            return;
+        };
+
+        let last_row = DisplayRow(block.end.0.saturating_sub(1));
+        let start =
+            display_map.display_point_to_point(DisplayPoint::new(block.start, 0), Bias::Left);
+        let end = display_map.display_point_to_point(
+            DisplayPoint::new(last_row, display_map.line_len(last_row)),
+            Bias::Right,
+        );
+        let text: String = display_map
+            .buffer_snapshot()
+            .text_for_range(start..end)
+            .collect();
+
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     pub fn show_diff_review_overlay(
         &mut self,
         display_range: Range<DisplayRow>,

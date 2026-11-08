@@ -579,6 +579,8 @@ impl EditorElement {
             return;
         }
 
+        editor.clear_ghost_selection();
+
         let text_hitbox = &position_map.text_hitbox;
         let gutter_hitbox = &position_map.gutter_hitbox;
         let point_for_position = position_map.point_for_position(event.position);
@@ -606,6 +608,18 @@ impl EditorElement {
             click_count = 3; // Simulate triple-click when clicking the gutter to select lines
         } else if !text_hitbox.is_hovered(window) {
             return;
+        }
+
+        if click_count == 1 && !modifiers.modified() && point_for_position.on_deleted_diff_row {
+            let ghost_point = position_map
+                .snapshot
+                .display_snapshot
+                .clip_point(point_for_position.exact_unclipped, Bias::Left);
+            if editor.begin_ghost_selection(ghost_point, &position_map.snapshot.display_snapshot) {
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
         }
 
         let hint_glyph = text_hitbox
@@ -867,6 +881,32 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if editor.ghost_drag_active {
+            editor.finish_ghost_selection();
+
+            let is_click = editor
+                .ghost_selection
+                .as_ref()
+                .is_some_and(|selection| selection.anchor == selection.head);
+            if is_click {
+                editor.clear_ghost_selection();
+                let point_for_position = position_map.point_for_position(event.position);
+                editor.select(
+                    SelectPhase::Begin {
+                        position: point_for_position.nearest_valid,
+                        add: false,
+                        click_count: 1,
+                    },
+                    window,
+                    cx,
+                );
+            }
+
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         // Handle diff review drag completion
         if editor.diff_review_drag_state.is_some() {
             editor.end_diff_review_drag(window, cx);
@@ -1045,6 +1085,18 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if editor.ghost_drag_active {
+            let point_for_position = position_map.point_for_position(event.position);
+            let ghost_point = position_map
+                .snapshot
+                .display_snapshot
+                .clip_point(point_for_position.exact_unclipped, Bias::Left);
+            editor.extend_ghost_selection(ghost_point, &position_map.snapshot.display_snapshot);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         if editor.has_autoscroll_request()
             || !editor.has_pending_selection()
                 && matches!(editor.selection_drag_state, SelectionDragState::None)

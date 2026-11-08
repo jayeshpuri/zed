@@ -497,6 +497,8 @@ actions!(
         Copy,
         /// Copies selected text to the clipboard with leading/trailing whitespace trimmed.
         CopyAndTrim,
+        /// Copies the deleted lines of the diff hunk at the cursor to the clipboard.
+        CopyDeletedHunkText,
         /// Copies the current file location to the clipboard.
         CopyFileLocation,
         /// Copies the highlighted text as JSON.

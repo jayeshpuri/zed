@@ -62,6 +62,7 @@ use multi_buffer::{
     Anchor, ExcerptRange, ExpandExcerptDirection, ExpandInfo, MultiBufferOffset, MultiBufferPoint,
     MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset,
 };
+use text::SelectionGoal;
 
 use project::{
     debugger::breakpoint_store::{Breakpoint, BreakpointSessionState},
@@ -139,7 +140,9 @@ impl LineNumberStyle {
     }
 }
 
-#[derive(Debug)]
+const GHOST_SELECTION_ID: usize = usize::MAX;
+
+#[derive(Clone, Debug)]
 struct SelectionLayout {
     id: usize,
     head: DisplayPoint,
@@ -957,6 +960,30 @@ impl EditorElement {
                         contains_non_empty_selection.selection |= !is_empty;
                     }
                     layouts.push(layout);
+                }
+
+                if let Some(ghost_range) = editor.ghost_selection_range(&snapshot.display_snapshot)
+                {
+                    let start = ghost_range.start.to_point(&snapshot.display_snapshot);
+                    let end = ghost_range.end.to_point(&snapshot.display_snapshot);
+                    if start != end {
+                        layouts.push(SelectionLayout::new(
+                            Selection {
+                                id: GHOST_SELECTION_ID,
+                                start,
+                                end,
+                                reversed: false,
+                                goal: SelectionGoal::None,
+                            },
+                            false,
+                            false,
+                            CursorShape::Bar,
+                            &snapshot.display_snapshot,
+                            false,
+                            false,
+                            None,
+                        ));
+                    }
                 }
 
                 let mut player = editor.current_user_player_color(cx);
@@ -3022,6 +3049,71 @@ impl EditorElement {
                 } else {
                     None
                 }
+            })
+            .collect()
+    }
+
+    fn ranges_skipping_deleted_rows(
+        map: &DisplaySnapshot,
+        range: Range<DisplayPoint>,
+    ) -> Vec<Range<DisplayPoint>> {
+        if range.start == range.end {
+            return Vec::new();
+        }
+        if !map.buffer_snapshot().has_diff_hunks() {
+            return vec![range];
+        }
+
+        let mut ranges = Vec::new();
+        let mut segment_start = range.start;
+        let mut row = range.start.row();
+
+        while row <= range.end.row() {
+            if crate::movement::is_deleted_diff_row(map, row) {
+                let deleted_start = DisplayPoint::new(row, 0);
+                if segment_start < deleted_start {
+                    ranges.push(segment_start..deleted_start);
+                }
+                segment_start = DisplayPoint::new(row.next_row(), 0);
+            }
+            row = row.next_row();
+        }
+
+        if segment_start < range.end {
+            ranges.push(segment_start..range.end);
+        }
+        ranges
+    }
+
+    fn split_selection_layouts_skipping_deleted_rows(
+        map: &DisplaySnapshot,
+        selections: &[(PlayerColor, Vec<SelectionLayout>)],
+    ) -> Vec<(PlayerColor, Vec<SelectionLayout>)> {
+        if !map.buffer_snapshot().has_diff_hunks() {
+            return selections.to_vec();
+        }
+
+        selections
+            .iter()
+            .map(|(player_color, layouts)| {
+                let layouts = layouts
+                    .iter()
+                    .flat_map(|layout| {
+                        if layout.id == GHOST_SELECTION_ID {
+                            vec![layout.clone()]
+                        } else {
+                            Self::ranges_skipping_deleted_rows(map, layout.range.clone())
+                                .into_iter()
+                                .map(|range| {
+                                    let mut layout = layout.clone();
+                                    layout.range = range;
+                                    layout
+                                })
+                                .collect()
+                        }
+                    })
+                    .collect();
+                (*player_color, layouts)
             })
             .collect()
     }
@@ -5996,20 +6088,32 @@ impl EditorElement {
                 Pixels::ZERO
             };
 
+            let display_snapshot = &layout.position_map.snapshot.display_snapshot;
             for (player_color, selections) in &layout.selections {
                 for selection in selections.iter() {
-                    self.paint_highlighted_range(
-                        selection.range.clone(),
-                        true,
-                        player_color.selection,
-                        corner_radius,
-                        corner_radius * 2.,
-                        layout,
-                        window,
-                    );
+                    let ranges = if selection.id == GHOST_SELECTION_ID {
+                        vec![selection.range.clone()]
+                    } else {
+                        Self::ranges_skipping_deleted_rows(
+                            display_snapshot,
+                            selection.range.clone(),
+                        )
+                    };
+
+                    for range in &ranges {
+                        self.paint_highlighted_range(
+                            range.clone(),
+                            true,
+                            player_color.selection,
+                            corner_radius,
+                            corner_radius * 2.,
+                            layout,
+                            window,
+                        );
+                    }
 
                     if selection.is_local && !selection.range.is_empty() {
-                        invisible_display_ranges.push(selection.range.clone());
+                        invisible_display_ranges.extend(ranges);
                     }
                 }
             }
@@ -9146,9 +9250,13 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    let bg_selections = Self::split_selection_layouts_skipping_deleted_rows(
+                        &snapshot.display_snapshot,
+                        &selections,
+                    );
                     let bg_segments_per_row = Self::bg_segments_per_row(
                         start_row..end_row,
-                        &selections,
+                        &bg_selections,
                         highlighted_ranges.iter().cloned().chain(
                             document_colors
                                 .iter()
@@ -10794,6 +10902,7 @@ pub struct PointForPosition {
     pub nearest_valid: DisplayPoint,
     pub exact_unclipped: DisplayPoint,
     pub column_overshoot_after_line_end: u32,
+    pub on_deleted_diff_row: bool,
 }
 
 impl PointForPosition {
@@ -10854,6 +10963,18 @@ impl PositionMap {
         self.snapshot.inlay_hint_at(glyph).map(|_| glyph)
     }
 
+    fn is_deleted_diff_row(&self, row: DisplayRow) -> bool {
+        self.snapshot.buffer_snapshot().has_diff_hunks()
+            && crate::movement::is_deleted_diff_row(&self.snapshot.display_snapshot, row)
+    }
+
+    fn snap_off_deleted_row(&self, point: DisplayPoint) -> DisplayPoint {
+        if !self.snapshot.buffer_snapshot().has_diff_hunks() {
+            return point;
+        }
+        crate::movement::nearest_live_point(&self.snapshot.display_snapshot, point).unwrap_or(point)
+    }
+
     pub(crate) fn point_for_position(&self, position: gpui::Point<Pixels>) -> PointForPosition {
         let text_bounds = self.text_hitbox.bounds;
         let scroll_position = self.scroll_position;
@@ -10878,8 +10999,11 @@ impl PositionMap {
         };
 
         let mut exact_unclipped = DisplayPoint::new(DisplayRow(row), column);
-        let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
-        let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
+        let on_deleted_diff_row = self.is_deleted_diff_row(DisplayRow(row));
+        let previous_valid =
+            self.snap_off_deleted_row(self.snapshot.clip_point(exact_unclipped, Bias::Left));
+        let next_valid =
+            self.snap_off_deleted_row(self.snapshot.clip_point(exact_unclipped, Bias::Right));
 
         let nearest_valid = if previous_valid == next_valid {
             previous_valid
@@ -10900,6 +11024,7 @@ impl PositionMap {
             nearest_valid,
             exact_unclipped,
             column_overshoot_after_line_end,
+            on_deleted_diff_row,
         }
     }
 
@@ -10924,8 +11049,11 @@ impl PositionMap {
             };
 
         let mut exact_unclipped = DisplayPoint::new(row, column);
-        let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
-        let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
+        let on_deleted_diff_row = self.is_deleted_diff_row(row);
+        let previous_valid =
+            self.snap_off_deleted_row(self.snapshot.clip_point(exact_unclipped, Bias::Left));
+        let next_valid =
+            self.snap_off_deleted_row(self.snapshot.clip_point(exact_unclipped, Bias::Right));
 
         let nearest_valid = if previous_valid == next_valid {
             previous_valid
@@ -10946,6 +11074,7 @@ impl PositionMap {
             nearest_valid,
             exact_unclipped,
             column_overshoot_after_line_end,
+            on_deleted_diff_row,
         }
     }
 }

@@ -390,9 +390,19 @@ impl Editor {
                 }
                 prev_selection_was_entire_line = is_entire_line;
                 let mut len = 0;
-                for chunk in buffer.text_for_range(selection.start..selection.end) {
-                    text.push_str(chunk);
-                    len += chunk.len();
+                let live_range = buffer.anchor_range_to_buffer_anchor_range(
+                    buffer.anchor_before(selection.start)..buffer.anchor_after(selection.end),
+                );
+                if let Some((buffer_snapshot, range)) = live_range {
+                    for chunk in buffer_snapshot.text_for_range(range) {
+                        text.push_str(chunk);
+                        len += chunk.len();
+                    }
+                } else {
+                    for chunk in buffer.text_for_range(selection.start..selection.end) {
+                        text.push_str(chunk);
+                        len += chunk.len();
+                    }
                 }
 
                 clipboard_selections.push(ClipboardSelection::for_buffer(
@@ -417,6 +427,10 @@ impl Editor {
 
     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
+            return;
+        }
+        if self.ghost_selection.is_some() {
+            self.do_copy(false, cx);
             return;
         }
         let item = self.cut_common(true, window, cx);
@@ -579,7 +593,13 @@ impl Editor {
     }
 
     fn do_copy(&self, strip_leading_indents: bool, cx: &mut Context<Self>) {
-        let selections = self.selections.all::<Point>(&self.display_snapshot(cx));
+        let display_map = self.display_snapshot(cx);
+        if let Some(text) = self.ghost_selection_text(&display_map) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+
+        let selections = self.selections.all::<Point>(&display_map);
         let buffer = self.buffer.read(cx).read(cx);
         let mut text = String::new();
         let mut clipboard_selections = Vec::with_capacity(selections.len());
@@ -652,9 +672,20 @@ impl Editor {
                         selection_len += 1;
                     }
                 }
-                for chunk in buffer.text_for_range(trimmed_range.start..trimmed_range.end) {
-                    text.push_str(chunk);
-                    selection_len += chunk.len();
+                let live_range = buffer.anchor_range_to_buffer_anchor_range(
+                    buffer.anchor_before(trimmed_range.start)
+                        ..buffer.anchor_after(trimmed_range.end),
+                );
+                if let Some((buffer_snapshot, range)) = live_range {
+                    for chunk in buffer_snapshot.text_for_range(range) {
+                        text.push_str(chunk);
+                        selection_len += chunk.len();
+                    }
+                } else {
+                    for chunk in buffer.text_for_range(trimmed_range.start..trimmed_range.end) {
+                        text.push_str(chunk);
+                        selection_len += chunk.len();
+                    }
                 }
                 if add_trailing_newline {
                     text.push('\n');

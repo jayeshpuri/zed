@@ -973,6 +973,16 @@ struct SettledScrollRange {
     editor_bounds_size: Size<Pixels>,
 }
 
+/// A mouse selection over a deleted diff block. Deleted rows are not part of
+/// the live buffer, but users still need to select and copy that text, so this
+/// selection is kept separately from the editor's normal selections.
+#[derive(Clone, Debug)]
+pub(crate) struct GhostSelection {
+    pub anchor: DisplayPoint,
+    pub head: DisplayPoint,
+    pub rows: Range<DisplayRow>,
+}
+
 /// Zed's primary implementation of text input, allowing users to edit a [`MultiBuffer`].
 ///
 /// See the [module level documentation](self) for more information.
@@ -1173,6 +1183,9 @@ pub struct Editor {
     gutter_hover_button: (Option<GutterHoverButton>, Option<Task<()>>),
     pub(crate) gutter_diff_review_indicator: (Option<PhantomDiffReviewIndicator>, Option<Task<()>>),
     pub(crate) diff_review_drag_state: Option<DiffReviewDragState>,
+    /// Mouse selection over deleted diff rows, which are not part of the live buffer.
+    pub(crate) ghost_selection: Option<GhostSelection>,
+    pub(crate) ghost_drag_active: bool,
     /// Active diff review overlays. Multiple overlays can be open simultaneously
     /// when hunks have comments stored.
     pub(crate) diff_review_overlays: Vec<DiffReviewOverlay>,
@@ -2550,6 +2563,8 @@ impl Editor {
             gutter_hover_button: (None, None),
             gutter_diff_review_indicator: (None, None),
             diff_review_drag_state: None,
+            ghost_selection: None,
+            ghost_drag_active: false,
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
@@ -5262,6 +5277,74 @@ impl Editor {
             this.select_all(&SelectAll, window, cx);
             this.insert("", window, cx);
         });
+    }
+
+    pub(crate) fn clear_ghost_selection(&mut self) {
+        self.ghost_selection = None;
+        self.ghost_drag_active = false;
+    }
+
+    pub(crate) fn begin_ghost_selection(
+        &mut self,
+        point: DisplayPoint,
+        map: &DisplaySnapshot,
+    ) -> bool {
+        let Some(rows) = movement::deleted_block_bounds(map, point.row()) else {
+            return false;
+        };
+
+        let point = map.clip_point(point, Bias::Left);
+        self.ghost_selection = Some(GhostSelection {
+            anchor: point,
+            head: point,
+            rows,
+        });
+        self.ghost_drag_active = true;
+        true
+    }
+
+    pub(crate) fn extend_ghost_selection(&mut self, point: DisplayPoint, map: &DisplaySnapshot) {
+        let Some(selection) = &mut self.ghost_selection else {
+            return;
+        };
+
+        let last_row = selection.rows.end.0.saturating_sub(1);
+        let row = DisplayRow(point.row().0.clamp(selection.rows.start.0, last_row));
+        let column = point.column().min(map.line_len(row));
+        selection.head = map.clip_point(DisplayPoint::new(row, column), Bias::Left);
+    }
+
+    pub(crate) fn finish_ghost_selection(&mut self) {
+        self.ghost_drag_active = false;
+    }
+
+    pub(crate) fn ghost_selection_range(
+        &self,
+        map: &DisplaySnapshot,
+    ) -> Option<Range<DisplayPoint>> {
+        let selection = self.ghost_selection.as_ref()?;
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+
+        if !selection.rows.contains(&start.row())
+            || !selection.rows.contains(&end.row())
+            || !movement::is_deleted_diff_row(map, start.row())
+            || !movement::is_deleted_diff_row(map, end.row())
+        {
+            return None;
+        }
+
+        Some(start..end)
+    }
+
+    pub(crate) fn ghost_selection_text(&self, map: &DisplaySnapshot) -> Option<String> {
+        let range = self.ghost_selection_range(map)?;
+        let start = range.start.to_point(map);
+        let end = range.end.to_point(map);
+        Some(map.buffer_snapshot().text_for_range(start..end).collect())
     }
 
     pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -10116,6 +10199,7 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
+                self.clear_ghost_selection();
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.fit_gutter_line_number_width(false, cx);
@@ -10303,6 +10387,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_ghost_selection();
         self.inlay_hint_visibility_changed(cx);
         cx.notify();
     }
